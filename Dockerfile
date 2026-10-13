@@ -1,4 +1,3 @@
-# ---- build: static musl binary ----
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /src
