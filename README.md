@@ -25,7 +25,7 @@ On first launch it:
 Fill in `domains` and `token`, save, then right-click the tray icon → **Update now**
 (or double-click the icon).
 
-Icon colour: green = up to date, amber = starting, red = error (hover for details).
+Icon colour: green = up to date, amber = checking (at startup or after "Update now"), red = error (hover for details).
 
 Menu: status line · Update now · Edit settings… · Open log · Start with Windows · Quit
 
@@ -80,7 +80,7 @@ docker run -d --name duckdns --restart unless-stopped \
 |---|---|---|
 | `DUCKDNS_DOMAINS` | — | Comma-separated subdomains (with or without `.duckdns.org`) |
 | `DUCKDNS_TOKEN` | — | Your DuckDNS token |
-| `DUCKDNS_INTERVAL` | `300` | Seconds between checks (min 30) |
+| `DUCKDNS_INTERVAL` | `300` | Seconds between checks (min 60) |
 | `DUCKDNS_IPV6` | `false` | Also publish an AAAA record |
 
 The image is `FROM scratch` (only the static binary, a few MB) and runs as an

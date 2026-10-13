@@ -6,6 +6,7 @@ members = ["crates/duckdns-core", "crates/duckdns-tray", "crates/duckdns-daemon"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+rust-version = "1.89" # std File::try_lock (tray single-instance guard)
 
 [profile.release]
 opt-level = "z"

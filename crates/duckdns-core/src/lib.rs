@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 const FORCE_REFRESH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// After a failure, retry sooner than the normal interval
+/// (helps right after boot, before the network is up).
+pub const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
+/// Shortest allowed check interval, shared by both apps.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 const IPV4_PROVIDERS: &[&str] = &[
     "https://api.ipify.org",
     "https://ipv4.icanhazip.com",
@@ -138,19 +144,21 @@ impl Updater {
     /// `force` skips the "unchanged" shortcut.
     pub fn run(&mut self, force: bool) -> Result<Outcome, Error> {
         self.settings.validate()?;
-        let ips = self.detect_ips()?;
+        let detected = self.detect_ips()?;
+        let known = merge_with_last(&detected, self.last_sent.as_ref())?;
 
         let stale = self
             .last_success
-            .map_or(true, |t| t.elapsed() >= FORCE_REFRESH_AFTER);
-        if !force && !stale && self.last_sent.as_ref() == Some(&ips) {
-            return Ok(Outcome::Unchanged(ips));
+            .is_none_or(|t| t.elapsed() >= FORCE_REFRESH_AFTER);
+        if !force && !stale && self.last_sent.as_ref() == Some(&known) {
+            return Ok(Outcome::Unchanged(known));
         }
 
-        let changed = self.send(&ips)?;
-        self.last_sent = Some(ips.clone());
+        // Only what was detected now is sent; DuckDNS keeps the rest as is.
+        let changed = self.send(&detected)?;
+        self.last_sent = Some(known.clone());
         self.last_success = Some(Instant::now());
-        Ok(Outcome::Updated { ips, changed })
+        Ok(Outcome::Updated { ips: known, changed })
     }
 
     fn detect_ips(&self) -> Result<PublicIps, Error> {
@@ -172,10 +180,11 @@ impl Updater {
 
     /// Returns whether DuckDNS reported an actual change.
     fn send(&self, ips: &PublicIps) -> Result<bool, Error> {
+        let domains: Vec<String> = self.settings.domains.iter().map(|d| url_encode(d)).collect();
         let mut url = format!(
             "https://www.duckdns.org/update?domains={}&token={}&verbose=true",
-            self.settings.domains.join(","),
-            self.settings.token.trim()
+            domains.join(","),
+            url_encode(self.settings.token.trim())
         );
         if let Some(v4) = ips.v4 {
             url.push_str(&format!("&ip={v4}"));
@@ -211,9 +220,71 @@ impl Updater {
     }
 }
 
+/// Fills gaps in a fresh detection from what was last sent, so a lookup
+/// that briefly fails doesn't look like an IP change.
+///
+/// A missing IPv6 just keeps the previous one (DuckDNS leaves AAAA alone
+/// when `ipv6=` is omitted). A missing IPv4 is an error if we had one
+/// before: omitting `ip=` makes DuckDNS guess it from the request's source
+/// address, which can be wrong. IPv6-only hosts never had an IPv4, so they
+/// still update.
+fn merge_with_last(detected: &PublicIps, last: Option<&PublicIps>) -> Result<PublicIps, Error> {
+    let last_v4 = last.and_then(|l| l.v4);
+    if detected.v4.is_none() && last_v4.is_some() {
+        return Err(Error::NoIp);
+    }
+    Ok(PublicIps {
+        v4: detected.v4,
+        v6: detected.v6.or(last.and_then(|l| l.v6)),
+    })
+}
+
+/// Percent-encodes everything except RFC 3986 unreserved characters.
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ips(v4: Option<&str>, v6: Option<&str>) -> PublicIps {
+        PublicIps {
+            v4: v4.map(|s| s.parse().unwrap()),
+            v6: v6.map(|s| s.parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn missing_ipv6_keeps_the_previous_one() {
+        let last = ips(Some("1.2.3.4"), Some("2001:db8::1"));
+        let merged = merge_with_last(&ips(Some("1.2.3.4"), None), Some(&last)).unwrap();
+        assert_eq!(merged, last);
+    }
+
+    #[test]
+    fn missing_ipv4_after_having_one_is_an_error() {
+        let last = ips(Some("1.2.3.4"), Some("2001:db8::1"));
+        assert!(merge_with_last(&ips(None, Some("2001:db8::1")), Some(&last)).is_err());
+    }
+
+    #[test]
+    fn ipv6_only_host_still_updates() {
+        let only_v6 = ips(None, Some("2001:db8::1"));
+        assert_eq!(merge_with_last(&only_v6, None).unwrap(), only_v6);
+        assert_eq!(merge_with_last(&only_v6, Some(&only_v6)).unwrap(), only_v6);
+    }
+
+    #[test]
+    fn url_encoding() {
+        assert_eq!(url_encode("abc-123_x.y~"), "abc-123_x.y~");
+        assert_eq!(url_encode("a&b c=d"), "a%26b%20c%3Dd");
+    }
 
     #[test]
     fn domains_are_normalised() {

@@ -22,8 +22,14 @@ else
 fi
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/duckdns-tray"
+
+# App icon: the same duck as the tray icon, drawn by examples/app_icon.rs.
+ICONSET=target/AppIcon.iconset
+rm -rf "$ICONSET"
+cargo run --quiet --release --locked -p duckdns-tray --example app_icon -- "$ICONSET"
+iconutil -c icns -o "$APP/Contents/Resources/AppIcon.icns" "$ICONSET"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -33,6 +39,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>             <string>DuckDNS Updater</string>
     <key>CFBundleIdentifier</key>       <string>org.duckdns.updater</string>
     <key>CFBundleExecutable</key>       <string>duckdns-tray</string>
+    <key>CFBundleIconFile</key>         <string>AppIcon</string>
     <key>CFBundlePackageType</key>      <string>APPL</string>
     <key>CFBundleVersion</key>          <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>

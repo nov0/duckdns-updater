@@ -1,18 +1,14 @@
 //! Tray icon + menu on the main thread, IP checks on a worker thread.
 
 use crate::{autostart, config, icon};
-use duckdns_core::{Outcome, PublicIps, Updater};
+use duckdns_core::{Outcome, PublicIps, Updater, RETRY_AFTER_ERROR};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{MouseButton, TrayIconBuilder, TrayIconEvent};
-
-/// After a failure, retry sooner than the normal interval
-/// (helps right after boot, before the network is up).
-const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
+use tray_icon::{MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 enum UserEvent {
     Menu(MenuEvent),
@@ -35,12 +31,17 @@ pub fn run() {
         return; // already running
     };
 
-    if config::ensure_exists() {
-        config::log("First run: created config.toml and enabled autostart");
-        let _ = autostart::set(true);
+    let first_run = config::ensure_exists();
+    if first_run || autostart::is_enabled() {
+        // On later runs this re-points the entry in case the app was moved.
+        match autostart::set(true) {
+            Ok(()) if first_run => config::log("First run: created config.toml and enabled autostart"),
+            Ok(()) => {}
+            Err(e) => config::log(&format!("Could not set up autostart: {e}")),
+        }
+    }
+    if first_run {
         config::open_in_editor(&config::config_path());
-    } else if autostart::is_enabled() {
-        let _ = autostart::set(true); // re-point the entry if the .exe was moved
     }
 
     #[allow(unused_mut)]
@@ -123,12 +124,13 @@ pub fn run() {
                 button: MouseButton::Left,
                 ..
             })) => {
+                show_checking(&status_item, tray.as_ref());
                 let _ = update_now.send(());
             }
 
             Event::UserEvent(UserEvent::Menu(e)) => {
                 if e.id == update_item.id() {
-                    status_item.set_text("Checking…");
+                    show_checking(&status_item, tray.as_ref());
                     let _ = update_now.send(());
                 } else if e.id == settings_item.id() {
                     config::open_in_editor(&config::config_path());
@@ -207,10 +209,22 @@ fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
 
         force = false;
         match update_now.recv_timeout(wait) {
-            Ok(()) => force = true,
+            Ok(()) => {
+                force = true;
+                // Several clicks while busy mean one check, not one each.
+                while update_now.try_recv().is_ok() {}
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Immediate feedback for a manual check; the worker reports the result.
+fn show_checking(status_item: &MenuItem, tray: Option<&TrayIcon>) {
+    status_item.set_text("Checking…");
+    if let Some(t) = tray {
+        let _ = t.set_icon(Some(icon::make(icon::State::Working)));
     }
 }
 

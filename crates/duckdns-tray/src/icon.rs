@@ -1,4 +1,6 @@
 //! Tray icons are drawn in code, so the .exe needs no extra files.
+//! The same drawing, without the status dot, is the macOS app icon
+//! (see examples/app_icon.rs and scripts/bundle-macos.sh).
 
 use tray_icon::Icon;
 
@@ -26,15 +28,20 @@ pub fn make(state: State) -> Icon {
         State::Working => (210, 153, 34),
         State::Error => (207, 34, 46),
     };
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    Icon::from_rgba(rgba(SIZE, Some(dot)), SIZE, SIZE).expect("valid icon buffer")
+}
 
-    for py in 0..SIZE {
-        for px in 0..SIZE {
+/// The duck as a `size`×`size` RGBA buffer, with an optional status dot.
+pub fn rgba(size: u32, dot: Option<(u8, u8, u8)>) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+
+    for py in 0..size {
+        for px in 0..size {
             let (mut r, mut g, mut b, mut hits) = (0u32, 0u32, 0u32, 0u32);
             for sy in 0..SS {
                 for sx in 0..SS {
-                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) / SIZE as f32;
-                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / SIZE as f32;
+                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) / size as f32;
+                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / size as f32;
                     if let Some(c) = colour_at(x, y, dot) {
                         r += c.0 as u32;
                         g += c.1 as u32;
@@ -52,19 +59,23 @@ pub fn make(state: State) -> Icon {
             ]);
         }
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("valid icon buffer")
+    rgba
 }
 
 /// Colour at (x, y) in 0..1 coordinates (y points down), or None if transparent.
 /// Shapes are signed distances: negative inside, positive outside; a band of
 /// width STROKE just outside each shape is its black outline.
 /// Checked front to back: dot, eye, duck, beak.
-fn colour_at(x: f32, y: f32, dot: (u8, u8, u8)) -> Option<(u8, u8, u8)> {
+fn colour_at(x: f32, y: f32, dot: Option<(u8, u8, u8)>) -> Option<(u8, u8, u8)> {
+    let (dot_dist, dot_fill) = match dot {
+        Some(c) => (circle(x, y, 0.80, 0.80, 0.15), c),
+        None => (f32::INFINITY, BLACK), // no dot: never hit
+    };
     let layers = [
-        (circle(x, y, 0.80, 0.80, 0.15), dot),
+        (dot_dist, dot_fill),
         (circle(x, y, 0.65, 0.22, 0.045), BLACK),
         (duck(x, y), YELLOW),
-        (ellipse(x, y, 0.83, 0.25, 0.11, 0.075, 0.0), RED),
+        (ellipse(x, y, 0.80, 0.25, 0.10, 0.075, 0.0), RED),
     ];
     layers.into_iter().find_map(|(d, fill)| {
         if d < 0.0 {

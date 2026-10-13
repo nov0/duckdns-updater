@@ -3,7 +3,7 @@ name = "duckdns-tray"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version = "1.89" # std File::try_lock is used for the single-instance guard
+rust-version.workspace = true
 
 # Desktop-only (Windows + macOS). On Linux this crate compiles to a tiny stub,
 # so `cargo build --workspace` and the Docker build still work there.

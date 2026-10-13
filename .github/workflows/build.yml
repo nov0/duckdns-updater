@@ -7,11 +7,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   windows-tray:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The tray code only compiles on Windows/macOS, so lint it here.
+      - run: cargo clippy -p duckdns-tray --all-targets --locked -- -D warnings
       - run: cargo build --release --locked -p duckdns-tray
       - uses: actions/upload-artifact@v4
         with:
@@ -23,6 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy -p duckdns-tray --all-targets --locked -- -D warnings
       - run: ./scripts/bundle-macos.sh --universal
       - run: cd target && zip -qry DuckDNS-Updater-macos.zip "DuckDNS Updater.app"
       - uses: actions/upload-artifact@v4
