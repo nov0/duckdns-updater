@@ -1,23 +1,21 @@
 //! Tray icon + menu on the main thread, IP checks on a worker thread.
 
 use crate::{autostart, config, icon};
-use duckdns_core::{Outcome, PublicIps, Updater};
+use duckdns_core::{Outcome, PublicIps, Updater, RETRY_AFTER_ERROR};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{MouseButton, TrayIconBuilder, TrayIconEvent};
-
-/// After a failure, retry sooner than the normal interval
-/// (helps right after boot, before the network is up).
-const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
+use tray_icon::{MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 enum UserEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Status(Status),
+    /// The worker started a check on its own (e.g. config.toml was saved).
+    Checking,
 }
 
 struct Status {
@@ -35,12 +33,17 @@ pub fn run() {
         return; // already running
     };
 
-    if config::ensure_exists() {
-        config::log("First run: created config.toml and enabled autostart");
-        let _ = autostart::set(true);
+    let first_run = config::ensure_exists();
+    if first_run || autostart::is_enabled() {
+        // On later runs this re-points the entry in case the app was moved.
+        match autostart::set(true) {
+            Ok(()) if first_run => config::log("First run: created config.toml and enabled autostart"),
+            Ok(()) => {}
+            Err(e) => config::log(&format!("Could not set up autostart: {e}")),
+        }
+    }
+    if first_run {
         config::open_in_editor(&config::config_path());
-    } else if autostart::is_enabled() {
-        let _ = autostart::set(true); // re-point the entry if the .exe was moved
     }
 
     #[allow(unused_mut)]
@@ -110,6 +113,8 @@ pub fn run() {
                 }
             }
 
+            Event::UserEvent(UserEvent::Checking) => show_checking(&status_item, tray.as_ref()),
+
             Event::UserEvent(UserEvent::Status(s)) => {
                 status_item.set_text(&s.headline);
                 if let Some(t) = &tray {
@@ -123,12 +128,13 @@ pub fn run() {
                 button: MouseButton::Left,
                 ..
             })) => {
+                show_checking(&status_item, tray.as_ref());
                 let _ = update_now.send(());
             }
 
             Event::UserEvent(UserEvent::Menu(e)) => {
                 if e.id == update_item.id() {
-                    status_item.set_text("Checking…");
+                    show_checking(&status_item, tray.as_ref());
                     let _ = update_now.send(());
                 } else if e.id == settings_item.id() {
                     config::open_in_editor(&config::config_path());
@@ -152,8 +158,47 @@ pub fn run() {
     });
 }
 
+/// How often the worker looks at config.toml's modified time while waiting.
+const CONFIG_POLL: Duration = Duration::from_secs(1);
+/// After a save is noticed, give the editor a moment to finish writing.
+const SAVE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Why the worker stopped waiting.
+enum Wake {
+    Timer,
+    UpdateNow,
+    ConfigSaved,
+}
+
+/// Sleeps up to `wait`, but returns early on "Update now" or when
+/// config.toml is saved. None means the UI is gone.
+fn wait_for_wake(update_now: &Receiver<()>, wait: Duration, config_mtime: Option<SystemTime>) -> Option<Wake> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Some(Wake::Timer);
+        }
+        match update_now.recv_timeout(left.min(CONFIG_POLL)) {
+            Ok(()) => {
+                // Several clicks while busy mean one check, not one each.
+                while update_now.try_recv().is_ok() {}
+                return Some(Wake::UpdateNow);
+            }
+            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {
+                if config::modified() != config_mtime {
+                    thread::sleep(SAVE_SETTLE);
+                    return Some(Wake::ConfigSaved);
+                }
+            }
+        }
+    }
+}
+
 /// Background loop: re-reads the config every cycle (so edits apply without
 /// a restart), checks the IP, and reports status to the UI thread.
+/// Saving config.toml triggers a check right away.
 fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
     let mut updater: Option<Updater> = None;
     let mut force = true; // always push once at startup
@@ -162,6 +207,8 @@ fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
     loop {
         let mut wait = Duration::from_secs(300);
 
+        // Read before loading, so a save during the check is still noticed.
+        let config_mtime = config::modified();
         let result = config::load().and_then(|cfg| {
             wait = cfg.interval();
             let settings = cfg.settings();
@@ -205,12 +252,24 @@ fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
             return; // UI is gone
         }
 
-        force = false;
-        match update_now.recv_timeout(wait) {
-            Ok(()) => force = true,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
+        force = match wait_for_wake(&update_now, wait, config_mtime) {
+            Some(Wake::UpdateNow) => true,
+            Some(Wake::ConfigSaved) => {
+                config::log("Settings saved, checking now");
+                let _ = ui.send_event(UserEvent::Checking);
+                false // changed settings already force an update
+            }
+            Some(Wake::Timer) => false,
+            None => return,
+        };
+    }
+}
+
+/// Immediate feedback for a manual check; the worker reports the result.
+fn show_checking(status_item: &MenuItem, tray: Option<&TrayIcon>) {
+    status_item.set_text("Checking…");
+    if let Some(t) = tray {
+        let _ = t.set_icon(Some(icon::make(icon::State::Working)));
     }
 }
 

@@ -51,7 +51,7 @@ mod imp {
     }
 
     pub fn is_enabled() -> bool {
-        plist_path().map_or(false, |p| p.exists())
+        plist_path().is_ok_and(|p| p.exists())
     }
 
     /// Writes/removes the LaunchAgent. It takes effect at the next login;
@@ -65,6 +65,13 @@ mod imp {
             };
         }
         let exe = std::env::current_exe()?;
+        // A quarantined app opened outside /Applications runs from a random,
+        // temporary copy that is gone after a reboot; don't point login at it.
+        if exe.to_string_lossy().contains("/AppTranslocation/") {
+            return Err(io::Error::other(
+                "the app is running from a temporary location; move it to /Applications and open it again",
+            ));
+        }
         let exe = xml_escape(&exe.to_string_lossy());
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>

@@ -1,9 +1,10 @@
 //! Headless DuckDNS updater for Docker / Linux servers.
 //! Configured entirely through environment variables, logs to stdout.
 
-use duckdns_core::{parse_domains, Outcome, Settings, Updater};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use duckdns_core::{parse_domains, Outcome, Settings, Updater, MIN_INTERVAL, RETRY_AFTER_ERROR};
 use std::time::Duration;
+
+const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -18,6 +19,24 @@ fn log(msg: impl AsRef<str>) {
     println!("{}", msg.as_ref());
 }
 
+/// DUCKDNS_INTERVAL in seconds; warns instead of silently replacing bad values.
+fn interval_from_env() -> Duration {
+    let raw = env_or("DUCKDNS_INTERVAL", &DEFAULT_INTERVAL_SECS.to_string());
+    let secs = match raw.trim().parse::<u64>() {
+        Ok(s) => s,
+        Err(_) => {
+            log(format!("warning: DUCKDNS_INTERVAL={raw:?} is not a number, using {DEFAULT_INTERVAL_SECS}"));
+            DEFAULT_INTERVAL_SECS
+        }
+    };
+    let interval = Duration::from_secs(secs);
+    if interval < MIN_INTERVAL {
+        log(format!("warning: DUCKDNS_INTERVAL={secs} is below the minimum, using {}", MIN_INTERVAL.as_secs()));
+        return MIN_INTERVAL;
+    }
+    interval
+}
+
 fn main() {
     let settings = Settings {
         domains: parse_domains(&env_or("DUCKDNS_DOMAINS", "")),
@@ -29,14 +48,13 @@ fn main() {
         std::process::exit(2);
     }
 
-    let interval_secs: u64 = env_or("DUCKDNS_INTERVAL", "300").parse().unwrap_or(300).max(30);
-    let interval = Duration::from_secs(interval_secs);
+    let interval = interval_from_env();
 
-    // Shutdown channel: SIGINT/SIGTERM drop the sender and wake the loop.
-    let (tx, rx) = mpsc::channel::<()>();
-    let mut tx = Some(tx);
-    ctrlc::set_handler(move || {
-        tx.take();
+    // SIGINT/SIGTERM exit right away, even in the middle of a check:
+    // an interrupted update is harmless and is simply redone next start.
+    ctrlc::set_handler(|| {
+        log("shutting down");
+        std::process::exit(0);
     })
     .expect("failed to install signal handler");
 
@@ -45,22 +63,34 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         settings.domains.join(","),
         settings.ipv6,
-        interval_secs
+        interval.as_secs()
     ));
 
     let mut updater = Updater::new(settings);
+    let mut last_error = String::new();
     loop {
-        match updater.run(false) {
-            Ok(Outcome::Updated { ips, changed: true }) => log(format!("updated DuckDNS -> {ips}")),
-            Ok(Outcome::Updated { ips, changed: false }) => log(format!("DuckDNS already had {ips}")),
-            Ok(Outcome::Unchanged(_)) => {} // quiet when nothing happens
-            Err(e) => log(format!("error: {e}")),
-        }
-
-        match rx.recv_timeout(interval) {
-            Err(RecvTimeoutError::Timeout) => continue,
-            _ => break,
-        }
+        let wait = match updater.run(false) {
+            Ok(outcome) => {
+                if !last_error.is_empty() {
+                    log("recovered");
+                    last_error.clear();
+                }
+                match outcome {
+                    Outcome::Updated { ips, changed: true } => log(format!("updated DuckDNS -> {ips}")),
+                    Outcome::Updated { ips, changed: false } => log(format!("DuckDNS already had {ips}")),
+                    Outcome::Unchanged(_) => {} // quiet when nothing happens
+                }
+                interval
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg != last_error {
+                    log(format!("error: {msg}"));
+                    last_error = msg;
+                }
+                interval.min(RETRY_AFTER_ERROR)
+            }
+        };
+        std::thread::sleep(wait);
     }
-    log("shutting down");
 }

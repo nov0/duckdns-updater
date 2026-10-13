@@ -2,19 +2,20 @@
 //! Windows: %APPDATA%\DuckDNS Updater
 //! macOS:   ~/Library/Application Support/DuckDNS Updater
 
-use duckdns_core::{parse_domains, Settings};
+use duckdns_core::{parse_domains, Settings, MIN_INTERVAL};
 use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 const TEMPLATE: &str = r#"# DuckDNS Updater settings.
 # Changes are picked up automatically on the next check,
 # or right away with "Update now" in the tray menu.
 
-# Your subdomains WITHOUT ".duckdns.org", comma separated.
+# Your subdomains, comma separated ("myhome" or "myhome.duckdns.org").
 domains = "myhome"
 
 # Token shown at the top of https://www.duckdns.org after you log in.
@@ -53,7 +54,7 @@ impl FileConfig {
     }
 
     pub fn interval(&self) -> Duration {
-        Duration::from_secs(self.interval_minutes.clamp(1, 24 * 60) * 60)
+        Duration::from_secs(self.interval_minutes.min(24 * 60) * 60).max(MIN_INTERVAL)
     }
 }
 
@@ -79,14 +80,24 @@ pub fn log_path() -> PathBuf {
 }
 
 /// Writes the commented template if no config exists yet.
-/// Returns true on first run.
+/// Returns true on first run, i.e. only if the template was actually written.
 pub fn ensure_exists() -> bool {
     let path = config_path();
     if path.exists() {
         return false;
     }
-    let _ = fs::write(&path, TEMPLATE);
-    true
+    match fs::write(&path, TEMPLATE) {
+        Ok(()) => true,
+        Err(e) => {
+            log(&format!("Cannot create {}: {e}", path.display()));
+            false
+        }
+    }
+}
+
+/// Last-modified time of config.toml, to notice when it is saved.
+pub fn modified() -> Option<SystemTime> {
+    fs::metadata(config_path()).and_then(|m| m.modified()).ok()
 }
 
 pub fn load() -> Result<FileConfig, String> {
@@ -107,10 +118,14 @@ pub fn acquire_instance_lock() -> Option<File> {
     Some(file)
 }
 
+/// Both threads log; this keeps a rotation from racing with a write.
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
 /// Appends a timestamped line; rotates once the file passes 1 MB.
 pub fn log(msg: &str) {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = log_path();
-    if fs::metadata(&path).map_or(false, |m| m.len() > 1_000_000) {
+    if fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000) {
         let _ = fs::rename(&path, app_dir().join("log.old.txt"));
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
