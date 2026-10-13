@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const TEMPLATE: &str = r#"# DuckDNS Updater settings.
 # Changes are picked up automatically on the next check,
@@ -93,6 +93,11 @@ pub fn ensure_exists() -> bool {
             false
         }
     }
+}
+
+/// Last-modified time of config.toml, to notice when it is saved.
+pub fn modified() -> Option<SystemTime> {
+    fs::metadata(config_path()).and_then(|m| m.modified()).ok()
 }
 
 pub fn load() -> Result<FileConfig, String> {

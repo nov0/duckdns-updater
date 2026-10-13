@@ -4,7 +4,7 @@ use crate::{autostart, config, icon};
 use duckdns_core::{Outcome, PublicIps, Updater, RETRY_AFTER_ERROR};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -14,6 +14,8 @@ enum UserEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Status(Status),
+    /// The worker started a check on its own (e.g. config.toml was saved).
+    Checking,
 }
 
 struct Status {
@@ -111,6 +113,8 @@ pub fn run() {
                 }
             }
 
+            Event::UserEvent(UserEvent::Checking) => show_checking(&status_item, tray.as_ref()),
+
             Event::UserEvent(UserEvent::Status(s)) => {
                 status_item.set_text(&s.headline);
                 if let Some(t) = &tray {
@@ -154,8 +158,47 @@ pub fn run() {
     });
 }
 
+/// How often the worker looks at config.toml's modified time while waiting.
+const CONFIG_POLL: Duration = Duration::from_secs(1);
+/// After a save is noticed, give the editor a moment to finish writing.
+const SAVE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Why the worker stopped waiting.
+enum Wake {
+    Timer,
+    UpdateNow,
+    ConfigSaved,
+}
+
+/// Sleeps up to `wait`, but returns early on "Update now" or when
+/// config.toml is saved. None means the UI is gone.
+fn wait_for_wake(update_now: &Receiver<()>, wait: Duration, config_mtime: Option<SystemTime>) -> Option<Wake> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Some(Wake::Timer);
+        }
+        match update_now.recv_timeout(left.min(CONFIG_POLL)) {
+            Ok(()) => {
+                // Several clicks while busy mean one check, not one each.
+                while update_now.try_recv().is_ok() {}
+                return Some(Wake::UpdateNow);
+            }
+            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {
+                if config::modified() != config_mtime {
+                    thread::sleep(SAVE_SETTLE);
+                    return Some(Wake::ConfigSaved);
+                }
+            }
+        }
+    }
+}
+
 /// Background loop: re-reads the config every cycle (so edits apply without
 /// a restart), checks the IP, and reports status to the UI thread.
+/// Saving config.toml triggers a check right away.
 fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
     let mut updater: Option<Updater> = None;
     let mut force = true; // always push once at startup
@@ -164,6 +207,8 @@ fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
     loop {
         let mut wait = Duration::from_secs(300);
 
+        // Read before loading, so a save during the check is still noticed.
+        let config_mtime = config::modified();
         let result = config::load().and_then(|cfg| {
             wait = cfg.interval();
             let settings = cfg.settings();
@@ -207,16 +252,16 @@ fn worker(update_now: Receiver<()>, ui: EventLoopProxy<UserEvent>) {
             return; // UI is gone
         }
 
-        force = false;
-        match update_now.recv_timeout(wait) {
-            Ok(()) => {
-                force = true;
-                // Several clicks while busy mean one check, not one each.
-                while update_now.try_recv().is_ok() {}
+        force = match wait_for_wake(&update_now, wait, config_mtime) {
+            Some(Wake::UpdateNow) => true,
+            Some(Wake::ConfigSaved) => {
+                config::log("Settings saved, checking now");
+                let _ = ui.send_event(UserEvent::Checking);
+                false // changed settings already force an update
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
+            Some(Wake::Timer) => false,
+            None => return,
+        };
     }
 }
 

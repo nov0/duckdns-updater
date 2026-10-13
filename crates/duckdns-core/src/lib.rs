@@ -18,6 +18,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 pub const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
 /// Shortest allowed check interval, shared by both apps.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Pauses between attempts of the DuckDNS request. DuckDNS's own name
+/// servers are flaky: a lookup of www.duckdns.org often fails once and
+/// works a few seconds later.
+const SEND_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
 
 const IPV4_PROVIDERS: &[&str] = &[
     "https://api.ipify.org",
@@ -194,12 +198,25 @@ impl Updater {
         }
 
         // verbose=true answers e.g. "OK\n1.2.3.4\n\nUPDATED" or "...NOCHANGE"
-        let body = self.get(&url)?;
+        let body = self.get_retrying(&url)?;
         let mut lines = body.lines().map(str::trim);
         match lines.next() {
             Some("OK") => Ok(body.contains("UPDATED")),
             _ => Err(Error::Rejected),
         }
+    }
+
+    /// Like `get`, but retries network errors (not answers like "KO").
+    fn get_retrying(&self, url: &str) -> Result<String, Error> {
+        let mut result = self.get(url);
+        for delay in SEND_RETRY_DELAYS {
+            if !matches!(result, Err(Error::Http(_))) {
+                break;
+            }
+            std::thread::sleep(delay);
+            result = self.get(url);
+        }
+        result
     }
 
     fn get(&self, url: &str) -> Result<String, Error> {
