@@ -1,0 +1,9 @@
+[package]
+name = "duckdns-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# rustls + bundled webpki roots: no OpenSSL, no system CA store needed
+ureq = { version = "3", default-features = false, features = ["rustls"] }

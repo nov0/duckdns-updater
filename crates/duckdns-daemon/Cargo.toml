@@ -1,0 +1,10 @@
+[package]
+name = "duckdns-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+duckdns-core = { path = "../duckdns-core" }
+# "termination" also catches SIGTERM, so `docker stop` exits instantly
+ctrlc = { version = "3", features = ["termination"] }

@@ -1,0 +1,9 @@
+services:
+  duckdns:
+    build: .
+    image: duckdns-daemon:latest
+    container_name: duckdns
+    restart: unless-stopped
+    env_file: .env
+    # Use the host network if you want IPv6 detection to see the host's address
+    # network_mode: host

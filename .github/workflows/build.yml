@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-tray:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p duckdns-tray
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckdns-tray-windows
+          path: target/release/duckdns-tray.exe
+
+  macos-tray:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/bundle-macos.sh --universal
+      - run: cd target && zip -qry DuckDNS-Updater-macos.zip "DuckDNS Updater.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckdns-tray-macos
+          path: target/DuckDNS-Updater-macos.zip
+
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t duckdns-daemon:ci .
