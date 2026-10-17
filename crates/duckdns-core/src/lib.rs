@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// changed elsewhere (e.g. by hand on the DuckDNS website).
 const FORCE_REFRESH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+/// IP lookups have fallbacks, so a slow provider is skipped sooner.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// After a failure, retry sooner than the normal interval
 /// (helps right after boot, before the network is up).
@@ -34,7 +36,7 @@ const IPV6_PROVIDERS: &[&str] = &[
     "https://v6.ident.me",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
     /// Subdomain names only, e.g. `["myhome"]` for myhome.duckdns.org.
     pub domains: Vec<String>,
@@ -43,10 +45,31 @@ pub struct Settings {
     pub ipv6: bool,
 }
 
+/// Hand-written so the token never shows up in a debug print.
+impl fmt::Debug for Settings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Settings")
+            .field("domains", &self.domains)
+            .field("token", &"***")
+            .field("ipv6", &self.ipv6)
+            .finish()
+    }
+}
+
 impl Settings {
     pub fn validate(&self) -> Result<(), Error> {
         if self.domains.is_empty() {
             return Err(Error::Config("no domains configured".into()));
+        }
+        for (i, d) in self.domains.iter().enumerate() {
+            if !is_valid_subdomain(d) {
+                return Err(Error::Config(format!(
+                    "{d:?} is not a valid DuckDNS subdomain (use letters, digits and '-', e.g. \"myhome\")"
+                )));
+            }
+            if self.domains[..i].contains(d) {
+                return Err(Error::Config(format!("{d:?} is listed twice")));
+            }
         }
         let t = self.token.trim();
         if t.is_empty() || t.contains("your-token") {
@@ -54,6 +77,14 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// One DNS label: 1-63 letters, digits or '-', not starting or ending with '-'.
+fn is_valid_subdomain(d: &str) -> bool {
+    (1..=63).contains(&d.len())
+        && d.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !d.starts_with('-')
+        && !d.ends_with('-')
 }
 
 /// Accepts `"a, b.duckdns.org ,c"` and returns `["a", "b", "c"]`.
@@ -114,8 +145,29 @@ pub enum Outcome {
     Unchanged(PublicIps),
 }
 
+/// Where requests go. Only tests change these.
+struct Endpoints {
+    update: String,
+    v4: Vec<String>,
+    v6: Vec<String>,
+    retry_delays: Vec<Duration>,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
+        Self {
+            update: "https://www.duckdns.org/update".into(),
+            v4: owned(IPV4_PROVIDERS),
+            v6: owned(IPV6_PROVIDERS),
+            retry_delays: SEND_RETRY_DELAYS.to_vec(),
+        }
+    }
+}
+
 pub struct Updater {
     agent: ureq::Agent,
+    endpoints: Endpoints,
     settings: Settings,
     last_sent: Option<PublicIps>,
     last_success: Option<Instant>,
@@ -123,12 +175,15 @@ pub struct Updater {
 
 impl Updater {
     pub fn new(settings: Settings) -> Self {
+        Self::with_endpoints(settings, Endpoints::default())
+    }
+
+    fn with_endpoints(settings: Settings, endpoints: Endpoints) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(HTTP_TIMEOUT))
             .user_agent(concat!("duckdns-updater/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent, settings, last_sent: None, last_success: None }
+        Self { agent, endpoints, settings, last_sent: None, last_success: None }
     }
 
     pub fn settings(&self) -> &Settings {
@@ -165,9 +220,17 @@ impl Updater {
         Ok(Outcome::Updated { ips: known, changed })
     }
 
+    /// IPv4 and IPv6 are looked up at the same time, so a dead family
+    /// doesn't add its timeouts on top of the other one.
     fn detect_ips(&self) -> Result<PublicIps, Error> {
-        let v4 = self.first_answer(IPV4_PROVIDERS);
-        let v6 = if self.settings.ipv6 { self.first_answer(IPV6_PROVIDERS) } else { None };
+        let (v4, v6) = std::thread::scope(|s| {
+            let v6 = self
+                .settings
+                .ipv6
+                .then(|| s.spawn(|| self.first_answer::<Ipv6Addr>(&self.endpoints.v6)));
+            let v4 = self.first_answer::<Ipv4Addr>(&self.endpoints.v4);
+            (v4, v6.and_then(|h| h.join().ok().flatten()))
+        });
         if v4.is_none() && v6.is_none() {
             return Err(Error::NoIp);
         }
@@ -175,9 +238,9 @@ impl Updater {
     }
 
     /// Ask each provider in turn; return the first answer that parses as `T`.
-    fn first_answer<T: std::str::FromStr>(&self, providers: &[&str]) -> Option<T> {
+    fn first_answer<T: std::str::FromStr>(&self, providers: &[String]) -> Option<T> {
         providers.iter().find_map(|url| {
-            let body = self.get(url).ok()?;
+            let body = self.get(url, LOOKUP_TIMEOUT).ok()?;
             body.trim().parse::<T>().ok()
         })
     }
@@ -186,7 +249,8 @@ impl Updater {
     fn send(&self, ips: &PublicIps) -> Result<bool, Error> {
         let domains: Vec<String> = self.settings.domains.iter().map(|d| url_encode(d)).collect();
         let mut url = format!(
-            "https://www.duckdns.org/update?domains={}&token={}&verbose=true",
+            "{}?domains={}&token={}&verbose=true",
+            self.endpoints.update,
             domains.join(","),
             url_encode(self.settings.token.trim())
         );
@@ -208,21 +272,24 @@ impl Updater {
 
     /// Like `get`, but retries network errors (not answers like "KO").
     fn get_retrying(&self, url: &str) -> Result<String, Error> {
-        let mut result = self.get(url);
-        for delay in SEND_RETRY_DELAYS {
+        let mut result = self.get(url, HTTP_TIMEOUT);
+        for &delay in &self.endpoints.retry_delays {
             if !matches!(result, Err(Error::Http(_))) {
                 break;
             }
             std::thread::sleep(delay);
-            result = self.get(url);
+            result = self.get(url, HTTP_TIMEOUT);
         }
         result
     }
 
-    fn get(&self, url: &str) -> Result<String, Error> {
+    fn get(&self, url: &str, timeout: Duration) -> Result<String, Error> {
         let mut resp = self
             .agent
             .get(url)
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .call()
             .map_err(|e| Error::Http(self.redact(&e.to_string())))?;
         resp.body_mut()
@@ -233,7 +300,11 @@ impl Updater {
     /// Never let the token end up in a log file or tooltip.
     fn redact(&self, msg: &str) -> String {
         let token = self.settings.token.trim();
-        if token.is_empty() { msg.to_string() } else { msg.replace(token, "***") }
+        if token.is_empty() {
+            return msg.to_string();
+        }
+        // The URL carries the percent-encoded form, so hide that one too.
+        msg.replace(&url_encode(token), "***").replace(token, "***")
     }
 }
 
@@ -319,5 +390,217 @@ mod tests {
             ipv6: false,
         };
         assert!(s.validate().is_err());
+    }
+
+    fn settings(domains: &[&str]) -> Settings {
+        Settings {
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            token: "tok".into(),
+            ipv6: false,
+        }
+    }
+
+    #[test]
+    fn bad_domains_are_rejected() {
+        assert!(settings(&["home", "my-nas2"]).validate().is_ok());
+        for bad in ["my home", "-home", "home-", "www.home", "a_b", &"x".repeat(64)] {
+            assert!(settings(&[bad]).validate().is_err(), "{bad:?} should be rejected");
+        }
+        assert!(settings(&["home", "home"]).validate().is_err());
+    }
+
+    #[test]
+    fn debug_hides_the_token() {
+        let s = Settings { token: "secret-token".into(), ..settings(&["home"]) };
+        assert!(!format!("{s:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn redact_covers_the_encoded_token() {
+        let up = Updater::new(Settings { token: "a&b c".into(), ..settings(&["home"]) });
+        let msg = "failed: token=a%26b%20c and a&b c";
+        assert_eq!(up.redact(msg), "failed: token=*** and ***");
+    }
+
+    // --- Updater against a local fake server ---
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    type Reply = (u16, &'static str);
+
+    /// Answers /v4, /v6 and /update with scripted replies and records
+    /// every /update query.
+    struct Mock {
+        v4: Mutex<Reply>,
+        v6: Mutex<Reply>,
+        /// Used in order; the last one repeats.
+        update: Mutex<Vec<Reply>>,
+        updates: Mutex<Vec<String>>,
+    }
+
+    const UPDATED: Reply = (200, "OK\n1.2.3.4\n\nUPDATED");
+    const NOCHANGE: Reply = (200, "OK\n1.2.3.4\n\nNOCHANGE");
+    const DOWN: Reply = (500, "");
+
+    impl Mock {
+        fn set_v4(&self, r: Reply) {
+            *self.v4.lock().unwrap() = r;
+        }
+        fn set_v6(&self, r: Reply) {
+            *self.v6.lock().unwrap() = r;
+        }
+        fn set_update(&self, replies: &[Reply]) {
+            *self.update.lock().unwrap() = replies.to_vec();
+        }
+        fn updates(&self) -> Vec<String> {
+            self.updates.lock().unwrap().clone()
+        }
+
+        fn reply(&self, path: &str) -> Reply {
+            if path.starts_with("/v4") {
+                *self.v4.lock().unwrap()
+            } else if path.starts_with("/v6") {
+                *self.v6.lock().unwrap()
+            } else if path.starts_with("/update") {
+                self.updates.lock().unwrap().push(path.to_string());
+                let mut queue = self.update.lock().unwrap();
+                if queue.len() > 1 { queue.remove(0) } else { queue[0] }
+            } else {
+                (404, "")
+            }
+        }
+    }
+
+    fn mock_updater(s: Settings) -> (Updater, Arc<Mock>) {
+        let mock = Arc::new(Mock {
+            v4: Mutex::new((200, "1.2.3.4")),
+            v6: Mutex::new((200, "2001:db8::1")),
+            update: Mutex::new(vec![UPDATED]),
+            updates: Mutex::default(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = Arc::clone(&mock);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = Vec::new();
+                let mut chunk = [0; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = server.reply(&path);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let endpoints = Endpoints {
+            update: format!("{base}/update"),
+            v4: vec![format!("{base}/v4")],
+            v6: vec![format!("{base}/v6")],
+            retry_delays: vec![Duration::ZERO; 2],
+        };
+        (Updater::with_endpoints(s, endpoints), mock)
+    }
+
+    #[test]
+    fn unchanged_ip_is_not_resent() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        assert!(matches!(up.run(false), Ok(Outcome::Updated { changed: true, .. })));
+        assert!(matches!(up.run(false), Ok(Outcome::Unchanged(_))));
+        assert_eq!(mock.updates().len(), 1);
+        let q = &mock.updates()[0];
+        assert!(q.contains("domains=home") && q.contains("token=tok") && q.contains("ip=1.2.3.4"));
+        assert!(!q.contains("ipv6="));
+    }
+
+    #[test]
+    fn force_and_daily_refresh_resend() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        up.run(false).unwrap();
+        mock.set_update(&[NOCHANGE]);
+        assert!(matches!(up.run(true), Ok(Outcome::Updated { changed: false, .. })));
+
+        up.last_success = Instant::now().checked_sub(FORCE_REFRESH_AFTER);
+        assert!(matches!(up.run(false), Ok(Outcome::Updated { .. })));
+        assert_eq!(mock.updates().len(), 3);
+    }
+
+    #[test]
+    fn new_ip_or_new_settings_resend() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        up.run(false).unwrap();
+        mock.set_v4((200, "5.6.7.8"));
+        assert!(matches!(up.run(false), Ok(Outcome::Updated { .. })));
+        assert!(mock.updates()[1].contains("ip=5.6.7.8"));
+
+        up.set_settings(settings(&["home", "office"]));
+        assert!(matches!(up.run(false), Ok(Outcome::Updated { .. })));
+        assert!(mock.updates()[2].contains("domains=home,office"));
+    }
+
+    #[test]
+    fn network_errors_are_retried() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        mock.set_update(&[DOWN, DOWN, UPDATED]);
+        assert!(up.run(false).is_ok());
+        assert_eq!(mock.updates().len(), 3);
+    }
+
+    #[test]
+    fn ko_is_not_retried() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        mock.set_update(&[(200, "KO")]);
+        assert!(matches!(up.run(false), Err(Error::Rejected)));
+        assert_eq!(mock.updates().len(), 1);
+    }
+
+    #[test]
+    fn failed_update_is_not_cached() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        mock.set_update(&[DOWN, DOWN, DOWN, UPDATED]);
+        assert!(matches!(up.run(false), Err(Error::Http(_))));
+        assert!(matches!(up.run(false), Ok(Outcome::Updated { .. })));
+        assert_eq!(mock.updates().len(), 4);
+    }
+
+    #[test]
+    fn failed_ipv6_lookup_keeps_the_previous_one() {
+        let (mut up, mock) = mock_updater(Settings { ipv6: true, ..settings(&["home"]) });
+        up.run(false).unwrap();
+        assert!(mock.updates()[0].contains("ipv6=2001:db8::1"));
+
+        mock.set_v6(DOWN);
+        let known = ips(Some("1.2.3.4"), Some("2001:db8::1"));
+        assert_eq!(up.run(false).unwrap(), Outcome::Unchanged(known.clone()));
+        // A forced send leaves IPv6 out, so DuckDNS keeps the old AAAA record.
+        assert_eq!(up.run(true).unwrap(), Outcome::Updated { ips: known, changed: true });
+        assert!(!mock.updates()[1].contains("ipv6="));
+    }
+
+    #[test]
+    fn failed_ipv4_lookup_after_having_one_sends_nothing() {
+        let (mut up, mock) = mock_updater(Settings { ipv6: true, ..settings(&["home"]) });
+        up.run(false).unwrap();
+        mock.set_v4(DOWN);
+        assert!(matches!(up.run(true), Err(Error::NoIp)));
+        assert_eq!(mock.updates().len(), 1);
+    }
+
+    #[test]
+    fn no_ip_at_all_is_an_error() {
+        let (mut up, mock) = mock_updater(settings(&["home"]));
+        mock.set_v4((200, "not an ip"));
+        assert!(matches!(up.run(false), Err(Error::NoIp)));
+        assert!(mock.updates().is_empty());
     }
 }
