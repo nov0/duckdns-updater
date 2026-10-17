@@ -17,6 +17,14 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # Keeps the rust-version in Cargo.toml honest.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check --workspace --all-targets --locked
+
   windows-tray:
     runs-on: windows-latest
     steps:
@@ -26,6 +34,7 @@ jobs:
           components: clippy
       # The tray code only compiles on Windows/macOS, so lint it here.
       - run: cargo clippy -p duckdns-tray --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       - run: cargo build --release --locked -p duckdns-tray
       - uses: actions/upload-artifact@v7
         with:
@@ -40,6 +49,7 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy -p duckdns-tray --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       - run: ./scripts/bundle-macos.sh --universal
       - run: cd target && zip -qry DuckDNS-Updater-macos.zip "DuckDNS Updater.app"
       - uses: actions/upload-artifact@v7

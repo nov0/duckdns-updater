@@ -29,17 +29,38 @@ pub fn run() {
     std::panic::set_hook(Box::new(|info| config::log(&format!("PANIC: {info}"))));
 
     // Keep the lock alive until the process exits.
-    let Some(_instance_lock) = config::acquire_instance_lock() else {
-        return; // already running
+    let _instance_lock = match config::acquire_instance_lock() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => return, // already running
+        Err(e) => {
+            // Better a possible second icon than an app that never starts;
+            // if the folder is unusable, the tray shows the config error.
+            config::log(&format!("Cannot take the single-instance lock, starting anyway: {e}"));
+            None
+        }
     };
 
     let first_run = config::ensure_exists();
-    if first_run || autostart::is_enabled() {
+    if first_run {
+        config::log("First run: created config.toml");
+    }
+    // A failed first-run setup is retried on every launch until it works.
+    let pending = first_run || config::autostart_pending();
+    if pending || autostart::is_enabled() {
         // On later runs this re-points the entry in case the app was moved.
         match autostart::set(true) {
-            Ok(()) if first_run => config::log("First run: created config.toml and enabled autostart"),
-            Ok(()) => {}
-            Err(e) => config::log(&format!("Could not set up autostart: {e}")),
+            Ok(()) => {
+                if pending {
+                    config::log("Enabled autostart");
+                    config::set_autostart_pending(false);
+                }
+            }
+            Err(e) => {
+                config::log(&format!("Could not set up autostart: {e}"));
+                if pending {
+                    config::set_autostart_pending(true);
+                }
+            }
         }
     }
     if first_run {
@@ -142,8 +163,10 @@ pub fn run() {
                     config::open_in_editor(&config::log_path());
                 } else if e.id == autostart_item.id() {
                     let want = !autostart::is_enabled();
-                    if let Err(err) = autostart::set(want) {
-                        config::log(&format!("Could not change autostart: {err}"));
+                    match autostart::set(want) {
+                        // The user chose; stop retrying the first-run setup.
+                        Ok(()) => config::set_autostart_pending(false),
+                        Err(err) => config::log(&format!("Could not change autostart: {err}")),
                     }
                     // Reflect the real registry state, whatever happened.
                     autostart_item.set_checked(autostart::is_enabled());

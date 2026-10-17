@@ -4,8 +4,8 @@
 
 use duckdns_core::{parse_domains, Settings, MIN_INTERVAL};
 use serde::Deserialize;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -28,7 +28,8 @@ interval_minutes = 5
 ipv6 = false
 "#;
 
-#[derive(Debug, Deserialize)]
+// No Debug derive: it would print the token.
+#[derive(Deserialize)]
 pub struct FileConfig {
     #[serde(default)]
     pub domains: String,
@@ -71,6 +72,20 @@ pub fn app_dir() -> PathBuf {
     dir
 }
 
+/// config.toml holds the token, so the folder and file are owner-only.
+/// Also fixes files created by older versions with default permissions.
+/// (Windows: %APPDATA% is already private to the user and is inherited.)
+#[cfg(unix)]
+fn make_private(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::metadata(path) else { return };
+    if meta.permissions().mode() & 0o777 != mode {
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+            log(&format!("Cannot restrict permissions of {}: {e}", path.display()));
+        }
+    }
+}
+
 pub fn config_path() -> PathBuf {
     app_dir().join("config.toml")
 }
@@ -83,10 +98,18 @@ pub fn log_path() -> PathBuf {
 /// Returns true on first run, i.e. only if the template was actually written.
 pub fn ensure_exists() -> bool {
     let path = config_path();
+    #[cfg(unix)]
+    make_private(&app_dir(), 0o700);
     if path.exists() {
+        #[cfg(unix)]
+        make_private(&path, 0o600);
         return false;
     }
-    match fs::write(&path, TEMPLATE) {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600); // holds the token
+    match options.open(&path).and_then(|mut f| f.write_all(TEMPLATE.as_bytes())) {
         Ok(()) => true,
         Err(e) => {
             log(&format!("Cannot create {}: {e}", path.display()));
@@ -107,15 +130,44 @@ pub fn load() -> Result<FileConfig, String> {
 
 /// Holds an exclusive lock for the lifetime of the process so a second
 /// copy (e.g. autostart + manual launch) exits instead of adding a 2nd icon.
-pub fn acquire_instance_lock() -> Option<File> {
+/// `Ok(None)` means another copy is running; `Err` means the lock itself
+/// could not be taken (e.g. a permissions problem).
+pub fn acquire_instance_lock() -> io::Result<Option<File>> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(app_dir().join("instance.lock"))
-        .ok()?;
-    file.try_lock().ok()?;
-    Some(file)
+        .open(app_dir().join("instance.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Exists while first-run autostart setup still has to succeed, e.g. when
+/// the first launch was from a temporary location on macOS.
+fn autostart_pending_path() -> PathBuf {
+    app_dir().join("autostart-pending")
+}
+
+pub fn autostart_pending() -> bool {
+    autostart_pending_path().exists()
+}
+
+pub fn set_autostart_pending(pending: bool) {
+    let path = autostart_pending_path();
+    let result = if pending {
+        fs::write(&path, "")
+    } else {
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    };
+    if let Err(e) = result {
+        log(&format!("Cannot update {}: {e}", path.display()));
+    }
 }
 
 /// Both threads log; this keeps a rotation from racing with a write.
