@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/duckdns-core", "crates/duckdns-tray", "crates/duckdns-daemon"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.89" # std File::try_lock (tray single-instance guard)
