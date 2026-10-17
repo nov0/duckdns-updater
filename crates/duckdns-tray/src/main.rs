@@ -8,6 +8,8 @@ mod autostart;
 #[cfg(any(windows, target_os = "macos"))]
 mod config;
 #[cfg(any(windows, target_os = "macos"))]
+mod draw;
+#[cfg(any(windows, target_os = "macos"))]
 mod icon;
 
 #[cfg(any(windows, target_os = "macos"))]
