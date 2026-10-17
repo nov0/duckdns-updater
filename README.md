@@ -67,7 +67,15 @@ docker compose up -d --build
 docker logs -f duckdns
 ```
 
-Or without compose:
+Or run the published image from Docker Hub (amd64 and arm64):
+
+```bash
+docker run -d --name duckdns --restart unless-stopped \
+  -e DUCKDNS_DOMAINS=myhome -e DUCKDNS_TOKEN=xxxxxxxx \
+  nov0/duckdns-updater:latest
+```
+
+Or build it yourself without compose:
 
 ```bash
 docker build -t duckdns-daemon .
@@ -101,3 +109,6 @@ IPv6: api6.ipify.org → ipv6.icanhazip.com → v6.ident.me.
    ```
 
 The `release` workflow checks that the tag matches `Cargo.toml`, builds the Windows `.exe` and the macOS `.app` (zipped), and publishes a GitHub Release with auto-generated notes and a `SHA256SUMS.txt`.
+It also pushes a multi-arch (amd64 + arm64) image to Docker Hub as
+`nov0/duckdns-updater`, tagged `X.Y.Z`, `X.Y` and `latest`. This needs the
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets.
