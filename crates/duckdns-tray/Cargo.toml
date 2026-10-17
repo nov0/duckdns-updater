@@ -17,3 +17,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+
+# build.rs draws the duck into the Windows .exe icon.
+[build-dependencies]
+png = "0.18"
+winresource = { version = "0.1", default-features = false }

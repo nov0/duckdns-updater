@@ -3,10 +3,9 @@
 //!
 //!     cargo run --example app_icon -- target/AppIcon.iconset
 
-#[cfg(any(windows, target_os = "macos"))]
-#[allow(dead_code)] // only `rgba` is used here
-#[path = "../src/icon.rs"]
-mod icon;
+#[allow(dead_code)] // unused in the Linux stub
+#[path = "../src/draw.rs"]
+mod draw;
 
 #[cfg(any(windows, target_os = "macos"))]
 fn main() {
@@ -15,27 +14,11 @@ fn main() {
     for base in [16, 32, 128, 256, 512] {
         for (scale, suffix) in [(1, ""), (2, "@2x")] {
             let size = base * scale;
-            let png = encode_png(&with_margin(size), size);
+            let png = encode_png(&draw::with_margin(size), size);
             let path = format!("{dir}/icon_{base}x{base}{suffix}.png");
             std::fs::write(&path, png).expect("cannot write icon");
         }
     }
-}
-
-/// The duck drawn at 84% and centred: app icons need some margin, and the
-/// tray drawing touches its edges.
-#[cfg(any(windows, target_os = "macos"))]
-fn with_margin(size: u32) -> Vec<u8> {
-    let inner = (size * 84 / 100).max(1);
-    let offset = (size - inner) / 2;
-    let duck = icon::rgba(inner, None);
-    let mut out = vec![0u8; (size * size * 4) as usize];
-    for y in 0..inner {
-        let src = (y * inner * 4) as usize;
-        let dst = (((y + offset) * size + offset) * 4) as usize;
-        out[dst..dst + (inner * 4) as usize].copy_from_slice(&duck[src..src + (inner * 4) as usize]);
-    }
-    out
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
