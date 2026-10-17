@@ -90,3 +90,14 @@ unprivileged user. `docker stop` exits immediately (SIGTERM is handled).
 
 IPv4: api.ipify.org → ipv4.icanhazip.com → v4.ident.me (first that answers wins).
 IPv6: api6.ipify.org → ipv6.icanhazip.com → v6.ident.me.
+
+## Releasing
+
+1. Bump `version` in the root `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and merge to `main`.
+2. Tag the commit and push the tag:
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+The `release` workflow checks that the tag matches `Cargo.toml`, builds the Windows `.exe` and the macOS `.app` (zipped), and publishes a GitHub Release with auto-generated notes and a `SHA256SUMS.txt`.
