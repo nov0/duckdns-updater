@@ -1,0 +1,70 @@
+name: release
+
+# Push a version tag to publish a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # The tag must match the workspace version in Cargo.toml.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  windows:
+    needs: check-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p duckdns-tray
+      - run: Copy-Item target/release/duckdns-tray.exe DuckDNS-Updater-windows.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: DuckDNS-Updater-windows.exe
+
+  macos:
+    needs: check-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+      - run: ./scripts/bundle-macos.sh --universal
+      - run: cd target && zip -qry ../DuckDNS-Updater-macos.zip "DuckDNS Updater.app"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: DuckDNS-Updater-macos.zip
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - run: (cd dist && sha256sum * > SHA256SUMS.txt)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
