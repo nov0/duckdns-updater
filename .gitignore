@@ -1,2 +1,5 @@
 /target
 .env
+/.pi
+/scripts/cf-ddns.ps1
+/scripts/cf-ddns.log
